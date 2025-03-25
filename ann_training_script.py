@@ -133,7 +133,7 @@ def load_config(file_path):
         config = yaml.safe_load(file)
     return config
 
-def validate_model(model, val_dl, seq_l,  model_type, device):
+def validate_model(model, val_dl, trial, seq_l,  model_type, scaler, device):
     
     with torch.no_grad():
         ratio = 0
@@ -150,36 +150,48 @@ def validate_model(model, val_dl, seq_l,  model_type, device):
 
     model_values = []
     if model_type == "LSTM":
-
+        # there is certainly a problem with y_pred scale ! TODO
         i = 0
-        x_init = val_dl[0][0].float().to(device)
+        x_init = torch.tensor(trial[0][0]).float().to(device)
         xs = deque([], seq_l)
         for k in range(seq_l):
             xs.appendleft(x_init)
         
         # xs.appendleft(x_init)
-        model_positions = [xs[-1][0:2]] # get x, y
-        for x, y in val_dl:
+        model_positions = [xs[-1][0:2]]
+        model_dx = [] # get x, y
+        for x, y in trial:
 
-            torch.tensor(list(xs)).to(device)
-            y_pred = torch.round(model(x))
+            x_in = torch.vstack(list(xs)).to(device).unsqueeze(0)
+            y_pred = torch.round(model(x_in))
 
-            x = x.float().to(device)
-            y = y.float().to(device)
+            x = torch.tensor(x).float().to(device)
+            y = torch.tensor(y).float().to(device)
             # get [x_to, y_to] 
             t_to = x[2:4]
             
             # (x,y)_t+1
-            x_next = xs[-1][0:2] + y_pred
+            # x is scaled, hence the movement needs to be scale too ! TODO
+            # first idea scale the dispalcement !  not working :) 
+            disp_scale =  (y_pred[0] - torch.tensor(scaler.mean_[0:2]).to(device)) / torch.tensor(scaler.var_[0:2]).to(device)
+            # secod idea make the displacement in unscale values then scale them back 
+            unscale_x = scaler.inverse_transform(xs[0].cpu().detach().numpy().reshape(1, 4)) 
+            disp = y_pred.cpu().detach().numpy()
+            new_unscale_x = unscale_x[0:2] + [disp[0][0], disp[0][1], 0, 0]
+
+            x_next = torch.tensor(scaler.transform(new_unscale_x)[0]).to(device)
+
+            # x_next = xs[0][0:2] + disp_scale #/torch.tensor(scaler.mean_[0:2]).to(device)
+            new_x = torch.tensor([x_next[0], x_next[1], t_to[0], t_to[1]]).float().to(device)
+            xs.appendleft(new_x)
+            
+            model_positions.append(x_next[0:2])
+            model_dx.append(y_pred[0])
 
             i += 1
 
 
-        model_positions = torch.cat(model_positions)
-        x_in = torch.zeros((1,6), dtype=torch.float32).to(device)
-        # x_in[0] = 
-        x = deque(x_in, seq_l)
-    
+    return torch.vstack(model_positions).cpu().detach().numpy(), torch.vstack(model_dx).cpu().detach().numpy()
     # x = deque([])
 
             
@@ -216,18 +228,18 @@ if __name__ == "__main__":
     print(f"Training on {dataset_file}")
     data, y = read_dataset(dataset_file)
     scaler = StandardScaler()
-    train_data, val_data, train_y, val_y = train_test_split(data, y, test_size=0.2, random_state=42, shuffle=False)
+    train_data, val_data, train_y, val_y = train_test_split(data.to_numpy(), y.to_numpy(), test_size=0.2, random_state=42, shuffle=False)
 
 
     train_data = scaler.fit_transform(train_data)
     val_data = scaler.fit(val_data)
     if model_type == 'ANN':
-        train_dataset = FittsDataset(train_data, train_y.to_numpy())
-        val_dataset = FittsDataset(val_data, val_y.to_numpy())
+        train_dataset = FittsDataset(train_data, train_y)
+        val_dataset = FittsDataset(val_data, val_y)
         model = SimpleNN(train_dataset[0][0].shape[0], hidden_size, num_layers, output_size=2).to(device)
     else:
-        train_dataset = FittsDatasetSeq(train_data, train_y.to_numpy(), sequence_length)
-        val_dataset = FittsDatasetSeq(val_data, val_y.to_numpy(), sequence_length)
+        train_dataset = FittsDatasetSeq(train_data, train_y, sequence_length)
+        val_dataset = FittsDatasetSeq(val_data, val_y, sequence_length)
         model = LSTMModel(train_dataset[0][0].shape[-1], hidden_size, num_layers, output_size=2).to(device)
 
 
@@ -243,19 +255,35 @@ if __name__ == "__main__":
     loss_train, loss_val = training_loops(num_epochs, train_dataloader, val_dataloader, model, criterion, opt, device, 10)
 
 
-    first_trial_x = data.iloc[0, :].to_numpy()
-    first_trial_y = data.iloc[0, :].to_numpy()
+    first_trial_x = data.iloc[0:300, :].to_numpy()
+    first_trial_y = y.iloc[0:300, :].to_numpy()
 
+    first_trial_x = scaler.transform(first_trial_x)
+    trial_dataset = FittsDataset(first_trial_x, first_trial_y)
+    # if model_type == 'ANN':
+        
+    # else:
+    #     trial_dataset = FittsDatasetSeq(first_trial_x, first_trial_y, sequence_length)
 
+    position, dx = validate_model(model, val_dataloader, trial_dataset, sequence_length, model_type, scaler, device)
+    fig = plt.figure()
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(loss_train, label="train")
+    ax.plot(loss_val, label="val loss")
+    ax.set_title("training curves")
+    ax.set_xlabel("num epochs")
+    ax.set_ylabel("MSE")
+    ax.legend()
+    ax.grid(True)
+    ax.set_ylim((0, 10))
 
-    validate_model(model, val_dataloader, sequence_length, model_type, device)
-    plt.plot(loss_train, label="train")
-    plt.plot(loss_val, label="val loss")
-    plt.title("training curves")
-    plt.xlabel("num epochs")
-    plt.ylabel("MSE")
-    plt.legend()
-    plt.grid(True)
-    plt.ylim((0, 10))
+    fig = plt.figure()
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(position[:,0], position[:, 1], label="agent movement")
+    
+    x_r, _ = trial_dataset[:]
+    ax.plot(x_r[:,0], x_r[:, 1],  label="target movement")
+    ax.set_title("agent movement")
+    ax.legend()
     plt.show()
     # data
