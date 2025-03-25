@@ -226,7 +226,7 @@ if __name__ == "__main__":
         pop_size=neat_config['pop_size'], #best 500 
         species_size=neat_config['pop_size'],
         survival_threshold=neat_config['survival_threshold'],
-        genome=RecurrentGenome  (
+        genome=DefaultGenome (
             num_inputs=6,
             num_outputs=2,
             max_nodes=50,

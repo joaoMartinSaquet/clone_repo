@@ -153,17 +153,24 @@ def validate_model(model, val_dl, seq_l,  model_type, device):
 
         i = 0
         x_init = val_dl[0][0].float().to(device)
-        xs = [x_init]
+        xs = deque([], seq_l)
+        for k in range(seq_l):
+            xs.appendleft(x_init)
+        
+        # xs.appendleft(x_init)
+        model_positions = [xs[-1][0:2]] # get x, y
         for x, y in val_dl:
-            if i == 0:
-                model_positions.append(x)
+
+            torch.tensor(list(xs)).to(device)
+            y_pred = torch.round(model(x))
 
             x = x.float().to(device)
             y = y.float().to(device)
-            # get [x, y]
-
-
-            y_pred = torch.round(model(x))
+            # get [x_to, y_to] 
+            t_to = x[2:4]
+            
+            # (x,y)_t+1
+            x_next = xs[-1][0:2] + y_pred
 
             i += 1
 
@@ -233,7 +240,7 @@ if __name__ == "__main__":
 
 
     opt = torch.optim.Adam(model.parameters(), learning_rate)
-    loss_train, loss_val = training_loops(num_epochs, train_dataloader, val_dataloader, model_type, criterion, opt, device, 10)
+    loss_train, loss_val = training_loops(num_epochs, train_dataloader, val_dataloader, model, criterion, opt, device, 10)
 
 
     first_trial_x = data.iloc[0, :].to_numpy()
