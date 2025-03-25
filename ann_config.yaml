@@ -1,0 +1,8 @@
+hyperparameters:
+  hidden_size: 128       # Number of neurons in the hidden layer
+  learning_rate: 0.001  # Learning rate for the optimizer
+  num_epochs: 2        # Number of training epochs
+  batch_size: 32        # Batch size for training
+  num_layers: 3
+  model: "LSTM"          # ANN or LSTM 
+  sequence_length: 20

@@ -1,0 +1,12 @@
+# NEAT configuration 
+NEAT:
+  pop_size: 500
+  species_size: 20
+  survival_threshold: 0.01
+  
+
+# pipeline config
+pipeline:
+  gen_max: 500
+  fitness_target: 1.0
+  seed: 42
