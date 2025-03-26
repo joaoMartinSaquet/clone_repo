@@ -1,58 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from collections import deque
+from torch.utils.data import DataLoader
+
+
+from dataset_handling import *
+from model_handling import *
+
 
 import pandas as pd
 import yaml
 import matplotlib.pyplot as plt
-
+import numpy as np
+import json
 # to remove pandas error
 pd.options.mode.chained_assignment = None
-
-
-# Define a simple dataset class
-
-def read_dataset(datasets : str):
-        df = pd.read_csv(datasets)
-
-        data = df[["x", "y","x_to","y_to"]]
-        # data['xlag'] = data["x"].shift(1)
-        # data['ylag'] = data["y"].shift(1)
-
-        data.fillna(0, inplace=True)
-        # print(df.columns)
-        y = df[['dx', 'dy']]
-        return data, y
-
-class FittsDataset(Dataset):
-    def __init__(self,x, y):        
-        self.data = x
-        self.y_gt = y
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        # return self.data.iloc[idx, :].to_numpy(), self.y_gt.iloc[idx, :].to_numpy()
-        return self.data[idx, :], self.y_gt[idx, :]
-    
-class FittsDatasetSeq(Dataset):
-    def __init__(self,x, y, sequence_length):        
-        self.data = x
-        self.y_gt = y
-        self.seq_l = sequence_length
-
-    def __len__(self):
-        return len(self.data) - self.seq_l
-
-    def __getitem__(self, idx):
-        # return self.data.iloc[idx:idx+self.seq_l, :].to_numpy(), self.y_gt.iloc[idx + self.seq_l, :].to_numpy()
-        return self.data[idx:idx+self.seq_l, :], self.y_gt[idx + self.seq_l, :]
-        
 
 # Define a simple neural network model_type
 class SimpleNN(nn.Module):
@@ -107,7 +72,6 @@ def training_loops(epochs, train_dl, val_dl, model, criterion, opt, device, log_
 
             epoch_loss += loss.item()
         train_losses.append(epoch_loss/len(train_dl))
-        
         epoch_loss = 0.0
         with torch.no_grad():
             for x, y in val_dl:
@@ -125,6 +89,10 @@ def training_loops(epochs, train_dl, val_dl, model, criterion, opt, device, log_
             print(f'Epoch [{e+1}/{epochs}], training loss: {train_losses[-1]:.4f}, validation loss: {val_losses[-1]:.4f}')
 
 
+        if epoch_loss/len(train_dl) < 1e-4:
+            print("traininf ended")
+            break
+
     return train_losses, val_losses
 
 # Load configuration from YAML file
@@ -135,6 +103,7 @@ def load_config(file_path):
 
 def validate_model(model, val_dl, trial, seq_l,  model_type, scaler, device):
     
+
     with torch.no_grad():
         ratio = 0
         for x, y in val_dl:
@@ -144,60 +113,72 @@ def validate_model(model, val_dl, trial, seq_l,  model_type, scaler, device):
 
             d = torch.linalg.norm(y - y_pred)
             ratio += 1/(d+1)
-            print(f"input : {x}, y target : {y}, pred : {y_pred}")
+            # print(f"input : {x}, y target : {y}, pred : {y_pred}")
         ratio /= len(val_dl)
     print(f"validation ends Action Agreement Ratio {ratio}")
-
-    model_values = []
     if model_type == "LSTM":
-        # there is certainly a problem with y_pred scale ! TODO
-        i = 0
-        x_init = torch.tensor(trial[0][0]).float().to(device)
-        xs = deque([], seq_l)
-        for k in range(seq_l):
-            xs.appendleft(x_init)
-        
-        # xs.appendleft(x_init)
-        model_positions = [xs[-1][0:2]]
-        model_dx = [] # get x, y
-        for x, y in trial:
+        index_init = seq_l
+    else:
+        index_init = 1
 
+
+
+    x_init = torch.tensor(trial[0][0]).float().to(device)
+    xs = deque([], seq_l)
+    for k in range(seq_l):
+        xs.append(x_init)
+    
+
+    
+    # xs.appendleft(x_init)
+    model_positions = [xs[-1][0:2]]
+    model_dx = [] # get x, y
+    targets = [xs[-1][2:4]]
+    t_to = torch.tensor(trial[0 ][0][2:4]).float().to(device)
+    targets = [t_to]
+    for i in range(index_init,len(trial) - 1):
+        x, y = trial[i]
+        if model_type == "LSTM":
             x_in = torch.vstack(list(xs)).to(device).unsqueeze(0)
-            y_pred = torch.round(model(x_in))
+        else:
+            x_in = torch.tensor(xs[0])
+        y_pred = torch.round(model(x_in))
 
-            x = torch.tensor(x).float().to(device)
-            y = torch.tensor(y).float().to(device)
-            # get [x_to, y_to] 
-            t_to = x[2:4]
+        x = torch.tensor(x).float().to(device)
+        y = torch.tensor(y).float().to(device)
+        # get [x_to, y_to] 
             
-            # (x,y)_t+1
-            # x is scaled, hence the movement needs to be scale too ! TODO
-            # first idea scale the dispalcement !  not working :) 
-            disp_scale =  (y_pred[0] - torch.tensor(scaler.mean_[0:2]).to(device)) / torch.tensor(scaler.var_[0:2]).to(device)
-            # secod idea make the displacement in unscale values then scale them back 
-            unscale_x = scaler.inverse_transform(xs[0].cpu().detach().numpy().reshape(1, 4)) 
-            disp = y_pred.cpu().detach().numpy()
-            new_unscale_x = unscale_x[0:2] + [disp[0][0], disp[0][1], 0, 0]
-
-            x_next = torch.tensor(scaler.transform(new_unscale_x)[0]).to(device)
-
-            # x_next = xs[0][0:2] + disp_scale #/torch.tensor(scaler.mean_[0:2]).to(device)
-            new_x = torch.tensor([x_next[0], x_next[1], t_to[0], t_to[1]]).float().to(device)
-            xs.appendleft(new_x)
             
-            model_positions.append(x_next[0:2])
-            model_dx.append(y_pred[0])
+        unscale_x = scaler.inverse_transform(xs[-1].cpu().detach().numpy().reshape(1, 5)) 
+        disp = y_pred.cpu().detach().numpy()
+        if model_type == "LSTM":
+            new_unscale_x = unscale_x[0:2] + [disp[0][0], disp[0][1], 0, 0, 8]
+        else:
+            new_unscale_x = unscale_x[0:2] + [disp[0], disp[1], 0, 0, 8]
 
-            i += 1
+        x_next = torch.tensor(scaler.transform(new_unscale_x)[0]).to(device)
+        # t_to = torch.tensor(trial[i][0][2:4]).float().to(device)
+        targets.append(t_to)
+        # print("taget to reach : ", t_to)
+
+        # new_x = torch.tensor([x_next[0], x_next[1], t_to[0], t_to[1], trial[i+1][0][-1]]).float().to(device)
+        new_x = torch.tensor([x_next[0], x_next[1], t_to[0], t_to[1], trial[i][0][-1]]).float().to(device)
+        xs.append(new_x)
+            
+        model_positions.append(x_next[0:2])
+        model_dx.append(y_pred[0])
 
 
-    return torch.vstack(model_positions).cpu().detach().numpy(), torch.vstack(model_dx).cpu().detach().numpy()
+    return torch.vstack(model_positions).cpu().detach().numpy(), torch.vstack(model_dx).cpu().detach().numpy(), torch.vstack(targets).cpu().detach().numpy()
     # x = deque([])
+
 
             
 if __name__ == "__main__":
-    dataset_file = "datasets/P0_C0.csv"
-
+    dataset_file = "datasets/P2_C0.csv"
+    logs_dir = "resulat/ann/P2_C0/log.txt"
+    load = False
+    
     if torch.cuda.is_available():
         print("using cuda")
         device = torch.device("cuda")
@@ -206,7 +187,7 @@ if __name__ == "__main__":
         torch.device("cpu")
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Load hyperparameters
     config = load_config('ann_config.yaml')
     hyperparameters = config['hyperparameters']
@@ -223,67 +204,95 @@ if __name__ == "__main__":
     model_type = hyperparameters['model']
     sequence_length = hyperparameters['sequence_length']
 
+    logs_dir = "resultat/ann/" + model_type + "/"
 
-
+    print("logging on " + logs_dir)
     print(f"Training on {dataset_file}")
     data, y = read_dataset(dataset_file)
-    scaler = StandardScaler()
+    # scaler = StandardScaler()
+    scaler = MinMaxScaler(feature_range=(-1, 1))
     train_data, val_data, train_y, val_y = train_test_split(data.to_numpy(), y.to_numpy(), test_size=0.2, random_state=42, shuffle=False)
 
 
     train_data = scaler.fit_transform(train_data)
     val_data = scaler.fit(val_data)
+
     if model_type == 'ANN':
         train_dataset = FittsDataset(train_data, train_y)
         val_dataset = FittsDataset(val_data, val_y)
-        model = SimpleNN(train_dataset[0][0].shape[0], hidden_size, num_layers, output_size=2).to(device)
     else:
         train_dataset = FittsDatasetSeq(train_data, train_y, sequence_length)
         val_dataset = FittsDatasetSeq(val_data, val_y, sequence_length)
-        model = LSTMModel(train_dataset[0][0].shape[-1], hidden_size, num_layers, output_size=2).to(device)
+
+    if load:
+        model = torch.load(logs_dir + "best_one/model.pt", weights_only=False)
+    else:
+        if model_type == 'ANN':
+            model = SimpleNN(train_dataset[0][0].shape[0], hidden_size, num_layers, output_size=2).to(device)
+        else:
+
+            model = LSTMModel(train_dataset[0][0].shape[-1], hidden_size, num_layers, output_size=2).to(device)
 
 
     train_dataloader = DataLoader(train_dataset, batch_size, shuffle=True)
-    val_dataloader =  DataLoader(train_dataset, batch_size, shuffle=True)
+    val_dataloader =  DataLoader(train_dataset, batch_size, shuffle=False)
     # criterion
     criterion = torch.nn.MSELoss().to(device)
     # 
 
 
-
-    opt = torch.optim.Adam(model.parameters(), learning_rate)
-    loss_train, loss_val = training_loops(num_epochs, train_dataloader, val_dataloader, model, criterion, opt, device, 10)
-
-
-    first_trial_x = data.iloc[0:300, :].to_numpy()
-    first_trial_y = y.iloc[0:300, :].to_numpy()
-
-    first_trial_x = scaler.transform(first_trial_x)
-    trial_dataset = FittsDataset(first_trial_x, first_trial_y)
-    # if model_type == 'ANN':
-        
-    # else:
-    #     trial_dataset = FittsDatasetSeq(first_trial_x, first_trial_y, sequence_length)
-
-    position, dx = validate_model(model, val_dataloader, trial_dataset, sequence_length, model_type, scaler, device)
-    fig = plt.figure()
-    ax = fig.add_subplot(1,1,1)
-    ax.plot(loss_train, label="train")
-    ax.plot(loss_val, label="val loss")
-    ax.set_title("training curves")
-    ax.set_xlabel("num epochs")
-    ax.set_ylabel("MSE")
-    ax.legend()
-    ax.grid(True)
-    ax.set_ylim((0, 10))
-
-    fig = plt.figure()
-    ax = fig.add_subplot(1,1,1)
-    ax.plot(position[:,0], position[:, 1], label="agent movement")
+    if not load:
+        opt = torch.optim.Adam(model.parameters(), learning_rate)
+        loss_train, loss_val = training_loops(num_epochs, train_dataloader, val_dataloader, model, criterion, opt, device, 100)
+        torch.save(model, logs_dir + "model.pt")
     
-    x_r, _ = trial_dataset[:]
-    ax.plot(x_r[:,0], x_r[:, 1],  label="target movement")
+    first_trial_x_df = data.iloc[0:210, :].to_numpy()
+    first_trial_y = y.iloc[0:210, :].to_numpy()
+
+    first_trial_x = scaler.transform(first_trial_x_df)
+    trial_dataset = FittsDataset(first_trial_x, first_trial_y)
+
+    position, dx, targets = validate_model(model, val_dataloader, trial_dataset, sequence_length, model_type, scaler, device)
+    log_sim = np.hstack((position, targets, 0.8 * np.ones((position.shape[0], 1))))
+    log_sim = scaler.inverse_transform(log_sim)
+    
+    if not load:
+        fig = plt.figure()
+        ax = fig.add_subplot(1,1,1)
+        ax.plot(loss_train, label="train")
+        ax.plot(loss_val, label="val loss")
+        ax.set_title("training curves")
+        ax.set_xlabel("num epochs")
+        ax.set_ylabel("MSE")
+        ax.legend()
+        ax.grid(True)
+        ax.set_ylim((0, 10))
+        fig.savefig(logs_dir + "training_curves.png")
+                
+        with open(logs_dir + "log.txt", "w") as f:
+            f.write("loss_train: " + str(loss_train) + "\n")
+            f.write("loss_val: " + str(loss_val) + "\n")
+
+    fig = plt.figure()
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(log_sim[:,0], log_sim[:, 1], '.', label="agent movement")
+    
+    n = len(log_sim)
+    ax.plot(first_trial_x_df[:n,0], first_trial_x_df[:n, 1], '.',  label="target movement")
+    ax.plot(log_sim[:, 2], log_sim[:, 3], 'rx', label="target")
     ax.set_title("agent movement")
     ax.legend()
+
+
+  
+
+    
+
+    with open(logs_dir + "hyperparameters.json", "w") as f:
+        json.dump(hyperparameters, f)
+
+    fig.savefig(logs_dir + "agent_movement.png")
+
+
     plt.show()
     # data

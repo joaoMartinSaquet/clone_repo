@@ -25,9 +25,7 @@ pd.options.mode.chained_assignment = None
 def read_dataset(datasets : str):
     data = pd.read_csv(datasets)
     
-    data_input = data[["x", "y","x_to","y_to"]]
-    data_input['xlag'] = data["x"].shift(1)
-    data_input['ylag'] = data["y"].shift(1)
+    data_input = data[["x", "y","x_to","y_to", "dt"]]
     # data_input['xlag_2'] = data["x"].shift(2)
     # data_input['ylag_2'] = data["y"].shift(2)
     # # data_input['dxlag'] = data["dx"].shift(1)
@@ -51,7 +49,7 @@ def read_dataset(datasets : str):
 class cloneProblem(BaseProblem):
 
     jitable = True
-    alpha = 1 # best 0.5
+    alpha = 0.5 # best 0.5
     loss = "aar"
         # actions
     def get_data(self, env_input, displacement):
@@ -69,7 +67,7 @@ class cloneProblem(BaseProblem):
 
         if self.loss == "aar":
             # print("here")
-            dist = jnp.square(self.displacement - disp_predict)
+            dist = jnp.linalg.norm(self.displacement - disp_predict)
             loss = 1/(self.alpha*dist + 1.0) # continous action agreement
             # loss = jnp.exp(-dist)
             loss = jnp.mean(loss)
@@ -84,7 +82,7 @@ class cloneProblem(BaseProblem):
     @property
     def input_shape(self):
         # the input shape that the act_func expects
-        return (6, )
+        return (5, )
     
     @property
     def output_shape(self):
@@ -100,7 +98,7 @@ class cloneProblem(BaseProblem):
         if self.loss == "aar":
             # # my vision of action agreement ratio
             dist = jnp.linalg.norm(disp_predict - self.displacement, axis=1)
-            loss = 1/(self.alpha*dist + 1.0) # continous action agreement
+            loss = 1/(dist + 1.0) # continous action agreement
             loss = jnp.mean(loss)
         else:
             # mse loss
@@ -114,7 +112,7 @@ class cloneProblem(BaseProblem):
 
 
 
-def validate_genome(pipeline, state, best, plot=False):
+def validate_genome(pipeline, state, best , scaler, plot=False):
     print("\n\n------------------------   Validation ! ------------------------ ")
     pipeline.show(state, best)
     
@@ -128,56 +126,26 @@ def validate_genome(pipeline, state, best, plot=False):
         genome.setup(state)
 
         transformed = genome.transform(state, *best)
-        x0 = jax.device_get(problem.input[0][0:4])
-        
-        # x0 = problem.input[0][0:2]
-        dxs = deque([0,0,0,0,0,0], 6)
-        jds = np.array(dxs)
-        x = [x0[0:4]]
-        m_input = jnp.hstack((x0,jds))
-
+        act_fun = jax.jit(genome.forward)
 
         n = problem.input.shape[0]
-        n = 5
-
+        # n = 5
+        xc = problem.input[0]
+        positions = [jax.device_get(xc[0:2])]
         for i in range(n):
             
-            d = genome.forward(state, transformed, m_input)
-            print(f"x \t y \t x_targe \t  y_target \t dx_pred \t dy_pred\n {x[-1][0]} \t {x[-1][1]} \t {x[-1][2]} \t {x[-1][3]} \t {d[0]} \t {d[1]}" )
-            jd = np.hstack((jax.device_get(jnp.round(d)), [0,0]))
+            jax_d = act_fun(state, transformed, xc)
 
-            dxs.appendleft(jd[1].item()) # y 
-            dxs.appendleft(jd[0].item()) # x
-            # (x,y)
-            jds = np.array(dxs)
+
+            unscale_position = scaler.inverse_transform(jax.device_get(xc).reshape(1, xc.shape[0]))
+            new_unscale_position = unscale_position[0, 0:2] + jax.device_get(jax_d)
+            scale_position = scaler.transform(jnp.hstack((new_unscale_position ,np.array([0,0,0]))).reshape(1, xc.shape[0]))
             
-        
-            x += [x[-1] + jd] 
-            # target to 
-            if i < n:
-                k = i+1
-            else:
-                k = i
-            target = problem.input[k][2:4]  
-            x[-1][-2:] = target 
-            m_input = jnp.hstack((x[-1],jds))
-        traj_agent = np.array(x)[:,0:2]
-        traj_user = np.array(jax.device_get(problem.input[:, 0:2])) 
+            positions.append(scale_position[0][0:2])
+            xc = jax.device_get(problem.input[i+1])
+            xc = jnp.array([scale_position[0][0], scale_position[0][1], xc[2], xc[3], xc[4]])
 
-        mse_error = np.mean((traj_user[:n] - traj_agent[:-1])**2)
-        fig = plt.figure()
-
-        ax = fig.add_subplot(1,1,1)
-        ax.set_title("reconstruction evolved agent trajectories " + str(mse_error) )
-        ax.set_xlabel("x pixel")
-        ax.set_ylabel("y pixel")
-        ax.plot(traj_agent[:,0], traj_agent[:,1], '.', label="agent trajectory")
-        ax.plot(traj_user[:,0], traj_user[:,1], '-', label="user trajectory")
-        ax.legend()
-        plt.savefig(pipeline.save_dir + 'calidation.png')
-        # plt.show()
-        print("done")
-
+    return positions
 
 if __name__ == "__main__":
 
@@ -226,8 +194,8 @@ if __name__ == "__main__":
         pop_size=neat_config['pop_size'], #best 500 
         species_size=neat_config['pop_size'],
         survival_threshold=neat_config['survival_threshold'],
-        genome=DefaultGenome (
-            num_inputs=6,
+        genome=RecurrentGenome (
+            num_inputs=5,
             num_outputs=2,
             max_nodes=50,
             init_hidden_layers=(),
@@ -259,4 +227,10 @@ if __name__ == "__main__":
     state, best = pipeline.auto_run(state)
     net = pipeline.algorithm.genome.network_dict(state, *best)
     # pipeline.algorithm.genome.visualize(net, save_path=log_dir + '/net.png')
-    validate_genome(pipeline, state, best, False)
+    positions = validate_genome(pipeline, state, best, scaler, True)
+
+    positions = np.array(positions)
+
+    plt.plot(positions[:, 0], positions[:, 1], '.', label="agent movement")
+    plt.plot(env_input[:, 0], env_input[:, 1], label="ground truth")
+    plt.show()
